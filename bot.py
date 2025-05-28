@@ -5,18 +5,19 @@ import wavelink
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 
-# Carga las variables de entorno
+# Carga de variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LAVALINK_URL = os.getenv("LAVALINK_URL")
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
-# Parseo de host/puerto para NodePool
+# Parsear host y puerto
 parsed = urlparse(LAVALINK_URL or "")
 HOST = parsed.hostname or "localhost"
 PORT = parsed.port or 2333
 SECURE = (parsed.scheme == "https")
 
+# Inicializar bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -24,53 +25,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
-
-    # 1) Intentamos create_node (Wavelink 2.x / 2.6.x)
-    if hasattr(wavelink.NodePool, "create_node"):
-        try:
-            await wavelink.NodePool.create_node(
-                bot=bot,
-                host=HOST,
-                port=PORT,
-                password=LAVALINK_PASSWORD,
-                secure=SECURE
-            )
-            print(f"[WAVELINK] Usando NodePool.create_node, nodos: {wavelink.NodePool._nodes}")
-        except Exception as e:
-            print(f"❌ Error en create_node: {e}")
-
-    # 2) Si no funcionó, intentamos connect (Wavelink 3.x+)
-    elif hasattr(wavelink.NodePool, "connect"):
-        try:
-            await wavelink.NodePool.connect(
-                bot=bot,
-                host=HOST,
-                port=PORT,
-                password=LAVALINK_PASSWORD,
-                secure=SECURE
-            )
-            print(f"[WAVELINK] Usando NodePool.connect, nodos: {wavelink.NodePool._nodes}")
-        except Exception as e:
-            print(f"❌ Error en NodePool.connect: {e}")
-
-    # 3) Verificamos cuántos nodos efectivamente conectados
-    nodes = getattr(wavelink.NodePool, "_nodes", None)
-    count = len(nodes) if nodes else 0
-    print(f"[WAVELINK] Nodos activos tras on_ready: {count}")
+    # Conectar Lavalink usando create_node (disponible en wavelink 2.3.0)
+    try:
+        await wavelink.NodePool.create_node(
+            bot=bot,
+            host=HOST,
+            port=PORT,
+            password=LAVALINK_PASSWORD,
+            secure=SECURE
+        )
+        print(f"[Lavalink] Nodo conectado en {HOST}:{PORT} (secure={SECURE})")
+    except Exception as e:
+        print(f"❌ Error al conectar Lavalink: {e}")
 
 @bot.command()
 async def join(ctx):
-    # Depuración: antes de unirnos, mostramos lista de nodos conectados
-    nodes = getattr(wavelink.NodePool, "_nodes", [])
-    print(f"[join] Nodos disponibles: {nodes}")
-
-    if not nodes:
-        return await ctx.send("❌ No hay nodos Lavalink conectados. Revisa los logs de on_ready.")
+    # Sólo si el nodo está conectado
+    if not wavelink.NodePool._nodes:
+        return await ctx.send("❌ Lavalink no está conectado. Revisa los logs.")
     if not ctx.author.voice:
         return await ctx.send("❌ Conéctate a un canal de voz primero.")
-
-    # Esto inicializa el player y asigna un nodo
-    player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
+    await ctx.author.voice.channel.connect(cls=wavelink.Player)
     await ctx.send("✅ Me he unido al canal de voz.")
 
 @bot.command()
@@ -104,7 +79,7 @@ async def play(ctx, *, query: str = None):
 @bot.command()
 async def skip(ctx):
     if not ctx.voice_client or not ctx.voice_client.is_playing():
-        return await ctx.send("❌ No hay ninguna canción reproduciéndose.")
+        return await ctx.send("❌ No hay reproducción activa.")
     await ctx.voice_client.stop()
     await ctx.send("⏭️ Canción saltada.")
 
@@ -113,10 +88,10 @@ async def stop(ctx):
     if not ctx.voice_client:
         return await ctx.send("❌ No estoy en un canal de voz.")
     await ctx.voice_client.disconnect()
-    await ctx.send("👋 Me he desconectado del canal de voz.")
+    await ctx.send("👋 Me he desconectado.")
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ ERROR: La variable DISCORD_TOKEN no está definida.")
+        print("❌ ERROR: Falta DISCORD_TOKEN")
         exit(1)
     bot.run(TOKEN)
