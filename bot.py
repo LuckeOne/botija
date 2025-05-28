@@ -5,19 +5,18 @@ import wavelink
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 
-# Carga de variables de entorno
+# Carga las variables de entorno
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LAVALINK_URL = os.getenv("LAVALINK_URL")
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
-# Parseo de host/puerto para la llamada a connect/create_node
+# Parseo de host/puerto para NodePool
 parsed = urlparse(LAVALINK_URL or "")
 HOST = parsed.hostname or "localhost"
 PORT = parsed.port or 2333
 SECURE = (parsed.scheme == "https")
 
-# Configuración de intents y bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -26,22 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
 
-    # Si existe NodePool.connect (Wavelink 3.x+), úsala:
-    if hasattr(wavelink.NodePool, "connect"):
-        try:
-            await wavelink.NodePool.connect(
-                bot=bot,
-                host=HOST,
-                port=PORT,
-                password=LAVALINK_PASSWORD,
-                secure=SECURE
-            )
-            print(f"[WAVELINK] Conectado con NodePool.connect en {HOST}:{PORT}")
-            return
-        except Exception as e:
-            print(f"❌ Error en NodePool.connect: {e}")
-
-    # Si existe create_node (Wavelink 2.x), úsala:
+    # 1) Intentamos create_node (Wavelink 2.x / 2.6.x)
     if hasattr(wavelink.NodePool, "create_node"):
         try:
             await wavelink.NodePool.create_node(
@@ -51,19 +35,42 @@ async def on_ready():
                 password=LAVALINK_PASSWORD,
                 secure=SECURE
             )
-            print(f"[WAVELINK] Conectado con create_node en {HOST}:{PORT}")
-            return
+            print(f"[WAVELINK] Usando NodePool.create_node, nodos: {wavelink.NodePool._nodes}")
         except Exception as e:
             print(f"❌ Error en create_node: {e}")
 
-    # Si llegamos aquí, no se pudo conectar
-    print("❌ No se pudo conectar a Lavalink: métodos connect/create_node no disponibles o fallaron.")
+    # 2) Si no funcionó, intentamos connect (Wavelink 3.x+)
+    elif hasattr(wavelink.NodePool, "connect"):
+        try:
+            await wavelink.NodePool.connect(
+                bot=bot,
+                host=HOST,
+                port=PORT,
+                password=LAVALINK_PASSWORD,
+                secure=SECURE
+            )
+            print(f"[WAVELINK] Usando NodePool.connect, nodos: {wavelink.NodePool._nodes}")
+        except Exception as e:
+            print(f"❌ Error en NodePool.connect: {e}")
+
+    # 3) Verificamos cuántos nodos efectivamente conectados
+    nodes = getattr(wavelink.NodePool, "_nodes", None)
+    count = len(nodes) if nodes else 0
+    print(f"[WAVELINK] Nodos activos tras on_ready: {count}")
 
 @bot.command()
 async def join(ctx):
+    # Depuración: antes de unirnos, mostramos lista de nodos conectados
+    nodes = getattr(wavelink.NodePool, "_nodes", [])
+    print(f"[join] Nodos disponibles: {nodes}")
+
+    if not nodes:
+        return await ctx.send("❌ No hay nodos Lavalink conectados. Revisa los logs de on_ready.")
     if not ctx.author.voice:
         return await ctx.send("❌ Conéctate a un canal de voz primero.")
-    await ctx.author.voice.channel.connect(cls=wavelink.Player)
+
+    # Esto inicializa el player y asigna un nodo
+    player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
     await ctx.send("✅ Me he unido al canal de voz.")
 
 @bot.command()
