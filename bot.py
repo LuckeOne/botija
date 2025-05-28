@@ -25,18 +25,15 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
-
-    # Crear y conectar el nodo Lavalink directamente
-    node = wavelink.Node(
+    await wavelink.NodePool.create_node(
         bot=bot,
         host=HOST,
         port=PORT,
         password=LAVALINK_PASSWORD,
         secure=SECURE
     )
-    await node.connect()
-
     print(f"Lavalink conectado en {HOST}:{PORT} (secure={SECURE})")
+
 
 @bot.command()
 async def join(ctx):
