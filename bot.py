@@ -11,7 +11,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 LAVALINK_URL = os.getenv("LAVALINK_URL")
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
-# Parseo de host/puerto (para NodePool.create_node)
+# Parseo de host/puerto para la llamada a connect/create_node
 parsed = urlparse(LAVALINK_URL or "")
 HOST = parsed.hostname or "localhost"
 PORT = parsed.port or 2333
@@ -26,30 +26,38 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
 
-    # Intento API Wavelink 2.x
-    try:
-        await wavelink.NodePool.create_node(
-            bot=bot,
-            host=HOST,
-            port=PORT,
-            password=LAVALINK_PASSWORD,
-            secure=SECURE
-        )
-        print(f"[WAVELINK] Conectado con NodePool.create_node en {HOST}:{PORT}")
-        return
-    except AttributeError:
-        pass
+    # Si existe NodePool.connect (Wavelink 3.x+), úsala:
+    if hasattr(wavelink.NodePool, "connect"):
+        try:
+            await wavelink.NodePool.connect(
+                bot=bot,
+                host=HOST,
+                port=PORT,
+                password=LAVALINK_PASSWORD,
+                secure=SECURE
+            )
+            print(f"[WAVELINK] Conectado con NodePool.connect en {HOST}:{PORT}")
+            return
+        except Exception as e:
+            print(f"❌ Error en NodePool.connect: {e}")
 
-    # Fallback API Wavelink 3.x
-    try:
-        node = wavelink.Node(
-            uri=LAVALINK_URL,
-            password=LAVALINK_PASSWORD
-        )
-        await node.connect()
-        print(f"[WAVELINK] Conectado con Node(uri=…) en {LAVALINK_URL}")
-    except Exception as e:
-        print(f"❌ Error conectando Lavalink: {e}")
+    # Si existe create_node (Wavelink 2.x), úsala:
+    if hasattr(wavelink.NodePool, "create_node"):
+        try:
+            await wavelink.NodePool.create_node(
+                bot=bot,
+                host=HOST,
+                port=PORT,
+                password=LAVALINK_PASSWORD,
+                secure=SECURE
+            )
+            print(f"[WAVELINK] Conectado con create_node en {HOST}:{PORT}")
+            return
+        except Exception as e:
+            print(f"❌ Error en create_node: {e}")
+
+    # Si llegamos aquí, no se pudo conectar
+    print("❌ No se pudo conectar a Lavalink: métodos connect/create_node no disponibles o fallaron.")
 
 @bot.command()
 async def join(ctx):
