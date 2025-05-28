@@ -1,97 +1,117 @@
 import os
+import asyncio
 import discord
 from discord.ext import commands
-import wavelink
 from dotenv import load_dotenv
-from urllib.parse import urlparse
+import yt_dlp as youtube_dl
 
-# Carga de variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-LAVALINK_URL = os.getenv("LAVALINK_URL")
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
-# Parsear host y puerto
-parsed = urlparse(LAVALINK_URL or "")
-HOST = parsed.hostname or "localhost"
-PORT = parsed.port or 2333
-SECURE = (parsed.scheme == "https")
-
-# Inicializar bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-@bot.event
-async def on_ready():
-    print(f"Bot conectado como {bot.user}")
-    # Conectar Lavalink usando create_node (disponible en wavelink 2.3.0)
-    try:
-        await wavelink.NodePool.create_node(
-            bot=bot,
-            host=HOST,
-            port=PORT,
-            password=LAVALINK_PASSWORD,
-            secure=SECURE
-        )
-        print(f"[Lavalink] Nodo conectado en {HOST}:{PORT} (secure={SECURE})")
-    except Exception as e:
-        print(f"❌ Error al conectar Lavalink: {e}")
+# Cola global de canciones por guild
+queues = {}
+
+ytdl_opts = {
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'skip_download': True,
+    'extract_flat': 'in_playlist'
+}
+ffmpeg_opts = {
+    'options': '-vn'
+}
+ytdl = youtube_dl.YoutubeDL(ytdl_opts)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop):
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+        # Si es playlist, devolvemos la lista de entries
+        if 'entries' in data:
+            return data['entries']
+        return cls(discord.FFmpegPCMAudio(data['url'], **ffmpeg_opts), data=data)
 
 @bot.command()
 async def join(ctx):
-    # Sólo si el nodo está conectado
-    if not wavelink.NodePool._nodes:
-        return await ctx.send("❌ Lavalink no está conectado. Revisa los logs.")
     if not ctx.author.voice:
         return await ctx.send("❌ Conéctate a un canal de voz primero.")
-    await ctx.author.voice.channel.connect(cls=wavelink.Player)
-    await ctx.send("✅ Me he unido al canal de voz.")
+    await ctx.author.voice.channel.connect()
+    await ctx.send("✅ Me he unido al canal.")
 
 @bot.command()
-async def play(ctx, *, query: str = None):
-    if query is None:
-        return await ctx.send("❌ Debes indicar nombre o enlace de YouTube.")
-    if not ctx.voice_client:
-        if ctx.author.voice:
-            await ctx.author.voice.channel.connect(cls=wavelink.Player)
-        else:
-            return await ctx.send("❌ No estás en un canal de voz.")
-
-    player: wavelink.Player = ctx.voice_client
-    tracks = await wavelink.YouTubeTrack.search(query, return_first=False)
-    if not tracks:
-        return await ctx.send("❌ No encontré resultados en YouTube.")
-
-    if "playlist" in query and len(tracks) > 1:
-        await ctx.send(f"📜 Encolando playlist ({len(tracks)} canciones)...")
-        for t in tracks:
-            await player.queue.put_wait(t)
+async def leave(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Adiós.")
     else:
-        track = tracks[0]
-        await player.queue.put_wait(track)
-        await ctx.send(f"▶️ Encolada: **{track.title}**")
+        await ctx.send("❌ No estoy en ningún canal.")
 
-    if not player.is_playing():
-        next_track = await player.queue.get_wait()
-        await player.play(next_track)
+@bot.command()
+async def play(ctx, *, url: str):
+    """Reproduce un video o playlist de YouTube."""
+    vc = ctx.voice_client or await ctx.author.voice.channel.connect()
+    guild_id = ctx.guild.id
+    queues.setdefault(guild_id, asyncio.Queue())
+
+    info = await YTDLSource.from_url(url, loop=bot.loop)
+    # Si es playlist, info es lista de dicts
+    if isinstance(info, list):
+        await ctx.send(f"📜 Encolando playlist de {len(info)} canciones...")
+        for entry in info:
+            queues[guild_id].put_nowait(entry['url'])
+    else:
+        await ctx.send(f"▶️ Encolada: **{info.title}**")
+        queues[guild_id].put_nowait(url)
+
+    if not vc.is_playing():
+        await play_next(ctx, vc)
+
+async def play_next(ctx, vc):
+    guild_id = ctx.guild.id
+    try:
+        url = await queues[guild_id].get()
+    except asyncio.QueueEmpty:
+        await vc.disconnect()
+        return
+
+    # Extraer y reproducir
+    player = await YTDLSource.from_url(url, loop=bot.loop)
+    vc.play(player, after=lambda e: bot.loop.create_task(play_next(ctx, vc)))
 
 @bot.command()
 async def skip(ctx):
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
-        return await ctx.send("❌ No hay reproducción activa.")
-    await ctx.voice_client.stop()
-    await ctx.send("⏭️ Canción saltada.")
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("⏭️ Saltando canción.")
+    else:
+        await ctx.send("❌ No estoy reproduciendo nada.")
+
+@bot.command()
+async def queue(ctx):
+    q = queues.get(ctx.guild.id)
+    if not q or q.empty():
+        return await ctx.send("❌ La cola está vacía.")
+    items = list(q._queue)
+    msg = "\n".join(f"{i+1}. {item}" for i, item in enumerate(items))
+    await ctx.send(f"📃 Próximas:\n{msg}")
 
 @bot.command()
 async def stop(ctx):
-    if not ctx.voice_client:
-        return await ctx.send("❌ No estoy en un canal de voz.")
-    await ctx.voice_client.disconnect()
-    await ctx.send("👋 Me he desconectado.")
+    if ctx.voice_client:
+        await ctx.voice_client.stop()
+        await ctx.voice_client.disconnect()
+        await ctx.send("🛑 Detenido y desconectado.")
+    else:
+        await ctx.send("❌ No estoy en un canal.")
 
-if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ ERROR: Falta DISCORD_TOKEN")
-        exit(1)
-    bot.run(TOKEN)
+bot.run(TOKEN)
