@@ -5,19 +5,19 @@ import wavelink
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 
+# Carga de variables de entorno
 load_dotenv()
-
-# Variables de entorno
 TOKEN = os.getenv("DISCORD_TOKEN")
 LAVALINK_URL = os.getenv("LAVALINK_URL")
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD")
 
-# Parsear host/puerto
+# Parseo de host/puerto (para NodePool.create_node)
 parsed = urlparse(LAVALINK_URL or "")
 HOST = parsed.hostname or "localhost"
 PORT = parsed.port or 2333
 SECURE = (parsed.scheme == "https")
 
+# Configuración de intents y bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -25,15 +25,31 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot conectado como {bot.user}")
-    await wavelink.NodePool.create_node(
-        bot=bot,
-        host=HOST,
-        port=PORT,
-        password=LAVALINK_PASSWORD,
-        secure=SECURE
-    )
-    print(f"Lavalink conectado en {HOST}:{PORT} (secure={SECURE})")
 
+    # Intento API Wavelink 2.x
+    try:
+        await wavelink.NodePool.create_node(
+            bot=bot,
+            host=HOST,
+            port=PORT,
+            password=LAVALINK_PASSWORD,
+            secure=SECURE
+        )
+        print(f"[WAVELINK] Conectado con NodePool.create_node en {HOST}:{PORT}")
+        return
+    except AttributeError:
+        pass
+
+    # Fallback API Wavelink 3.x
+    try:
+        node = wavelink.Node(
+            uri=LAVALINK_URL,
+            password=LAVALINK_PASSWORD
+        )
+        await node.connect()
+        print(f"[WAVELINK] Conectado con Node(uri=…) en {LAVALINK_URL}")
+    except Exception as e:
+        print(f"❌ Error conectando Lavalink: {e}")
 
 @bot.command()
 async def join(ctx):
@@ -55,7 +71,7 @@ async def play(ctx, *, query: str = None):
     player: wavelink.Player = ctx.voice_client
     tracks = await wavelink.YouTubeTrack.search(query, return_first=False)
     if not tracks:
-        return await ctx.send("❌ No encontré resultados.")
+        return await ctx.send("❌ No encontré resultados en YouTube.")
 
     if "playlist" in query and len(tracks) > 1:
         await ctx.send(f"📜 Encolando playlist ({len(tracks)} canciones)...")
