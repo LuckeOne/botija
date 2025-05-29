@@ -30,6 +30,8 @@ FFMPEG_OPTS = {
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+# Remove default help command to allow custom help
+bot.remove_command('help')
 
 # One MusicPlayer per guild
 players: dict[int, "MusicPlayer"] = {}
