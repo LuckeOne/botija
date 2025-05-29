@@ -2,7 +2,6 @@ import os
 import asyncio
 import discord
 from discord.ext import commands
-from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
 
@@ -15,8 +14,8 @@ YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'skip_download': True,
-    'cookies': 'cookies.txt',  # Asegúrate de colocar cookies.txt
-    'default_search': 'ytsearch'
+    'cookies': 'cookies.txt',
+    'default_search': 'ytsearch',
 }
 FFMPEG_OPTS = {'options': '-vn'}
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
@@ -30,59 +29,40 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Cola de pistas por servidor
 queues: dict[int, asyncio.Queue[dict]] = {}
 
-class MusicControls(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="⏯️ Pause/Resume", style=discord.ButtonStyle.primary)
-    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if not vc:
-            return await interaction.response.send_message("No estoy en voz", ephemeral=True)
-        if vc.is_paused():
-            vc.resume()
-            await interaction.response.edit_message(content="▶️ Reanudado", view=self)
-        else:
-            vc.pause()
-            await interaction.response.edit_message(content="⏸️ Pausado", view=self)
-
-    @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
-            await interaction.response.send_message("⏭️ Saltado", ephemeral=True)
-        else:
-            await interaction.response.send_message("Nada que saltar", ephemeral=True)
-
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc:
-            vc.stop()
-            await vc.disconnect()
-            queues.pop(interaction.guild.id, None)
-            await interaction.response.send_message("⏹️ Detenido y desconectado", ephemeral=True)
-        else:
-            await interaction.response.send_message("No estoy en canal", ephemeral=True)
-
-async def enqueue_tracks(ctx: commands.Context, query: str):
+async def enqueue_tracks(ctx: commands.Context, query: str) -> list[dict]:
+    """Extrae pistas de URL o búsqueda, maneja playlists y omite videos no disponibles."""
     data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     tracks = []
+    # Función interna para procesar cada entrada
+    def make_track(entry):
+        return {
+            'url': entry.get('webpage_url'),
+            'title': entry.get('title'),
+            'uploader': entry.get('uploader'),
+            'duration': entry.get('duration'),  # segundos
+            'thumbnail': entry.get('thumbnail')
+        }
+
     if 'entries' in data:
         for entry in data['entries']:
-            vid = entry.get('id')
-            url = f"https://www.youtube.com/watch?v={vid}"
-            tracks.append({'url': url, 'title': entry.get('title', vid)})
+            try:
+                # entry puede ser dict con suficiente metadata
+                track = make_track(entry)
+                if track['url']:
+                    tracks.append(track)
+            except Exception:
+                continue  # omitir entrada inválida
     else:
-        tracks.append({'url': data['url'], 'title': data.get('title')})
+        tracks.append(make_track(data))
 
+    # Encolar
     q = queues.setdefault(ctx.guild.id, asyncio.Queue())
     for t in tracks:
         await q.put(t)
     return tracks
 
 async def play_next(ctx: commands.Context):
+    """Reproduce la siguiente pista en la cola, o desconecta si no hay más."""
     q = queues.get(ctx.guild.id)
     vc = ctx.guild.voice_client
     if not q or q.empty():
@@ -91,18 +71,56 @@ async def play_next(ctx: commands.Context):
         return
 
     track = await q.get()
-    # Extraer info detallada para thumbnail
-    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(track['url'], download=False))
+    try:
+        # Extraer datos completos
+        data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(track['url'], download=False))
+    except Exception as e:
+        # Si falla, pasar al siguiente
+        return await play_next(ctx)
+
     source = discord.FFmpegPCMAudio(data['url'], **FFMPEG_OPTS)
 
-    embed = discord.Embed(title=data.get('title'), url=track['url'], color=discord.Color.blurple())
+    # Formatear duración mm:ss
+    dur = data.get('duration') or 0
+    mins, secs = divmod(dur, 60)
+    duration_str = f"{mins}:{secs:02d}"
+
+    embed = discord.Embed(
+        title=data.get('title'),
+        url=track['url'],
+        color=discord.Color.blurple(),
+        description=f"Uploader: **{data.get('uploader')}**\nDuration: **{duration_str}**"
+    )
     thumb = data.get('thumbnail')
     if thumb:
         embed.set_thumbnail(url=thumb)
 
-    view = MusicControls()
-    vc.play(source, after=lambda e: bot.loop.create_task(play_next(ctx)))
-    await ctx.send(embed=embed, view=view)
+    # Botones de control
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="⏯️ Pause/Resume", style=discord.ButtonStyle.primary, custom_id="pause"))
+    view.add_item(discord.ui.Button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, custom_id="skip"))
+    view.add_item(discord.ui.Button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="stop"))
+
+    def after_play(error):
+        bot.loop.create_task(play_next(ctx))
+
+    vc.play(source, after=after_play)
+    msg = await ctx.send(embed=embed, view=view)
+
+    # Manejar interacciones de botones
+    async def on_button(interaction: discord.Interaction):
+        if interaction.message.id != msg.id:
+            return
+        vc = ctx.guild.voice_client
+        custom_id = interaction.data.get('custom_id')
+        if custom_id == 'pause':
+            if vc.is_paused(): vc.resume(); await interaction.response.edit_message(embed=embed, view=view)
+            else: vc.pause(); await interaction.response.edit_message(embed=embed, view=view)
+        elif custom_id == 'skip':
+            vc.stop(); await interaction.response.send_message("⏭️ Saltado", ephemeral=True)
+        elif custom_id == 'stop':
+            vc.stop(); await vc.disconnect(); queues.pop(ctx.guild.id, None); await interaction.response.send_message("⏹️ Detenido", ephemeral=True)
+    bot.add_listener(on_button, 'on_interaction')
 
 @bot.command()
 async def join(ctx: commands.Context):
@@ -117,7 +135,7 @@ async def leave(ctx: commands.Context):
     if vc:
         await vc.disconnect()
         queues.pop(ctx.guild.id, None)
-        await ctx.send("👋 Desconectado y cola limpiada.")
+        await ctx.send("👋 Desconectado y cola limpia.")
     else:
         await ctx.send("❌ No estoy en un canal.")
 
@@ -145,17 +163,15 @@ async def queue_cmd(ctx: commands.Context):
     q = queues.get(ctx.guild.id)
     if not q or q.empty():
         return await ctx.send("❌ La cola está vacía.")
-    items = list(q._queue)
-    msg = "\n".join(f"{i+1}. {t['title']}" for i, t in enumerate(items))
+    titles = [t['title'] for t in list(q._queue)]
+    msg = "\n".join(f"{i+1}. {title}" for i,title in enumerate(titles))
     await ctx.send(f"📃 Próximas canciones:\n{msg}")
 
 @bot.command(name="stop")
 async def stop_cmd(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc:
-        vc.stop()
-        await vc.disconnect()
-        queues.pop(ctx.guild.id, None)
+        vc.stop(); await vc.disconnect(); queues.pop(ctx.guild.id, None)
         await ctx.send("🛑 Detenido y desconectado.")
     else:
         await ctx.send("❌ No estoy en un canal.")
