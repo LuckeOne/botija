@@ -9,11 +9,12 @@ import yt_dlp
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Opciones de yt-dlp
+# Opciones de yt-dlp con soporte de cookies
 ytdl_opts = {
     'format': 'bestaudio/best',
     'quiet': True,
     'skip_download': True,
+    'cookies': 'cookies.txt',  # 🟡 Asegúrate de que este archivo esté presente
 }
 ffmpeg_opts = {
     'options': '-vn'
@@ -46,17 +47,19 @@ async def play_next(ctx: commands.Context, vc: discord.VoiceClient):
         return await vc.disconnect()
 
     url = await queue.get()
-    # Si no es URL, lo convertimos a búsqueda ytsearch1:
     extract_url = url if is_url(url) else f"ytsearch1:{url}"
-    result = await get_audio_source(extract_url)
 
-    # Si get_audio_source devolvió lista, encolamos esas URLs
+    try:
+        result = await get_audio_source(extract_url)
+    except Exception as e:
+        await ctx.send(f"❌ Error al reproducir: {e}")
+        return await play_next(ctx, vc)
+
     if isinstance(result, list):
         for item in result:
             queue.put_nowait(item)
         return await play_next(ctx, vc)
 
-    # result es FFmpegPCMAudio ya listo
     vc.play(result, after=lambda e: bot.loop.create_task(play_next(ctx, vc)))
 
 @bot.command()
@@ -77,15 +80,11 @@ async def leave(ctx: commands.Context):
 @bot.command()
 async def play(ctx: commands.Context, *, query: str):
     """Reproduce una URL o búsqueda de YouTube."""
-    # Prepara la cola
     guild_id = ctx.guild.id
     queues.setdefault(guild_id, asyncio.Queue())
-
-    # Encola la consulta (URL o texto)
     queues[guild_id].put_nowait(query)
     await ctx.send(f"▶️ Encolada: **{query}**")
 
-    # Si no está reproduciendo, conéctate y arranca la reproducción
     vc = ctx.voice_client or await ctx.author.voice.channel.connect()
     if not vc.is_playing():
         await play_next(ctx, vc)
