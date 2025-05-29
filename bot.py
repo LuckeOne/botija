@@ -10,30 +10,29 @@ import yt_dlp
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Opciones de yt-dlp para extracción de audio y búsqueda
+# Configuración de yt-dlp (búsqueda y cookies)
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'skip_download': True,
-    'cookies': 'cookies.txt',  # Asegúrate de tener este archivo
-    'default_search': 'ytsearch',
-    'extract_flat': 'in_playlist'
+    'cookies': 'cookies.txt',  # Asegúrate de colocar cookies.txt
+    'default_search': 'ytsearch'
 }
 FFMPEG_OPTS = {'options': '-vn'}
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
-# Intents y bot
+# Inicialización del bot
+token = TOKEN
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Cola de pistas por guild
-queues: dict[int, asyncio.Queue] = {}
+# Cola de pistas por servidor
+queues: dict[int, asyncio.Queue[dict]] = {}
 
 class MusicControls(discord.ui.View):
-    def __init__(self, ctx):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.ctx = ctx
 
     @discord.ui.button(label="⏯️ Pause/Resume", style=discord.ButtonStyle.primary)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -67,43 +66,41 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("No estoy en canal", ephemeral=True)
 
-async def extract_tracks(query: str):
-    """Extrae información de URL o búsqueda, maneja playlists."""
+async def enqueue_tracks(ctx: commands.Context, query: str):
     data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     tracks = []
     if 'entries' in data:
         for entry in data['entries']:
             vid = entry.get('id')
-            url = f'https://www.youtube.com/watch?v={vid}'
-            tracks.append({
-                'url': url,
-                'title': entry.get('title', vid),
-                'thumbnail': entry.get('thumbnail')
-            })
+            url = f"https://www.youtube.com/watch?v={vid}"
+            tracks.append({'url': url, 'title': entry.get('title', vid)})
     else:
-        tracks.append({
-            'url': data['url'],
-            'title': data.get('title'),
-            'thumbnail': data.get('thumbnail')
-        })
+        tracks.append({'url': data['url'], 'title': data.get('title')})
+
+    q = queues.setdefault(ctx.guild.id, asyncio.Queue())
+    for t in tracks:
+        await q.put(t)
     return tracks
 
 async def play_next(ctx: commands.Context):
-    guild_id = ctx.guild.id
-    queue = queues.get(guild_id)
-    if not queue or queue.empty():
-        await ctx.voice_client.disconnect()
+    q = queues.get(ctx.guild.id)
+    vc = ctx.guild.voice_client
+    if not q or q.empty():
+        if vc:
+            await vc.disconnect()
         return
 
-    track = await queue.get()
-    vc = ctx.voice_client
-    source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS)
+    track = await q.get()
+    # Extraer info detallada para thumbnail
+    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(track['url'], download=False))
+    source = discord.FFmpegPCMAudio(data['url'], **FFMPEG_OPTS)
 
-    embed = discord.Embed(title=track['title'], description=track['url'], color=discord.Color.blurple())
-    if track.get('thumbnail'):
-        embed.set_thumbnail(url=track['thumbnail'])
-    view = MusicControls(ctx)
+    embed = discord.Embed(title=data.get('title'), url=track['url'], color=discord.Color.blurple())
+    thumb = data.get('thumbnail')
+    if thumb:
+        embed.set_thumbnail(url=thumb)
 
+    view = MusicControls()
     vc.play(source, after=lambda e: bot.loop.create_task(play_next(ctx)))
     await ctx.send(embed=embed, view=view)
 
@@ -126,15 +123,11 @@ async def leave(ctx: commands.Context):
 
 @bot.command()
 async def play(ctx: commands.Context, *, query: str):
-    guild_id = ctx.guild.id
-    if guild_id not in queues:
-        queues[guild_id] = asyncio.Queue()
-    tracks = await extract_tracks(query)
-    for t in tracks:
-        await queues[guild_id].put(t)
-    await ctx.send(f"📜 Encoladas {len(tracks)} pista(s).")
-
+    if not ctx.author.voice:
+        return await ctx.send("❌ Debes estar en un canal de voz.")
     vc = ctx.guild.voice_client or await ctx.author.voice.channel.connect()
+    tracks = await enqueue_tracks(ctx, query)
+    await ctx.send(f"📜 Encoladas {len(tracks)} pista(s): {', '.join(t['title'] for t in tracks[:3])}...")
     if not vc.is_playing():
         await play_next(ctx)
 
@@ -149,12 +142,12 @@ async def skip(ctx: commands.Context):
 
 @bot.command(name="queue")
 async def queue_cmd(ctx: commands.Context):
-    queue = queues.get(ctx.guild.id)
-    if not queue or queue.empty():
-        return await ctx.send("❌ Cola vacía.")
-    items = list(queue._queue)
-    msg = "\n".join(f"{i+1}. {t['title']}" for i,t in enumerate(items))
-    await ctx.send(f"📃 Próximas:\n{msg}")
+    q = queues.get(ctx.guild.id)
+    if not q or q.empty():
+        return await ctx.send("❌ La cola está vacía.")
+    items = list(q._queue)
+    msg = "\n".join(f"{i+1}. {t['title']}" for i, t in enumerate(items))
+    await ctx.send(f"📃 Próximas canciones:\n{msg}")
 
 @bot.command(name="stop")
 async def stop_cmd(ctx: commands.Context):
@@ -172,4 +165,4 @@ async def on_ready():
     print(f"Bot listo: {bot.user}")
 
 if __name__ == '__main__':
-    bot.run(TOKEN)
+    bot.run(token)
