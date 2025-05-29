@@ -35,21 +35,22 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 players: dict[int, "MusicPlayer"] = {}
 
 class MusicControls(discord.ui.View):
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: int, player: 'MusicPlayer'):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+        self.player = player
 
-    @discord.ui.button(label="⏯ Pause/Resume", style=discord.ButtonStyle.primary, custom_id="music:pause")
+    @discord.ui.button(label="⏯ Play/Resume", style=discord.ButtonStyle.primary, custom_id="music:pause")
     async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
         if not vc:
             return await interaction.response.send_message("No estoy conectado.", ephemeral=True)
         if vc.is_paused():
             vc.resume()
-            await interaction.response.edit_message(content="▶ Reanudado", view=self)
+            await interaction.response.edit_message(content=None, view=self)
         else:
             vc.pause()
-            await interaction.response.edit_message(content="⏸ Pausado", view=self)
+            await interaction.response.edit_message(content=None, view=self)
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.secondary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -71,6 +72,20 @@ class MusicControls(discord.ui.View):
             player.task.cancel()
         await interaction.response.send_message("⏹ Detenido y desconectado.", ephemeral=True)
 
+    @discord.ui.button(label="📜 Lista", style=discord.ButtonStyle.grey, custom_id="music:list")
+    async def queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = players.get(self.guild_id)
+        if not player or player.queue.empty():
+            return await interaction.response.send_message("La cola está vacía.", ephemeral=True)
+        upcoming = list(player.queue._queue)
+        lines = []
+        for i, t in enumerate(upcoming[:10], 1):
+            lines.append(f"{i}. {t['title']}")
+        text = "\n".join(lines)
+        if len(upcoming) > 10:
+            text += f"\n...y {len(upcoming)-10} más"
+        await interaction.response.send_message(f"**Próximas canciones:**\n{text}", ephemeral=True)
+
 class MusicPlayer:
     def __init__(self, ctx: commands.Context):
         self.ctx = ctx
@@ -89,7 +104,6 @@ class MusicPlayer:
 
         while True:
             track = await self.queue.get()
-            # Extract direct stream info
             info = await bot.loop.run_in_executor(
                 None,
                 lambda: ytdl.extract_info(track['webpage_url'], download=False)
@@ -97,7 +111,7 @@ class MusicPlayer:
             if not info or 'formats' not in info:
                 continue
 
-            # Choose best audio format
+            # Pick best
             formats = [f for f in info['formats'] if f.get('url')]
             fmt = max(formats, key=lambda f: f.get('abr') or 0)
             url = fmt['url']
@@ -106,54 +120,53 @@ class MusicPlayer:
             before = f"{FFMPEG_BEFORE} -headers \"{hdr_str}\""
             source = discord.FFmpegPCMAudio(url, before_options=before, options='-vn')
 
-            # Build embed
+            # Enhanced embed
             duration = track.get('duration') or 0
             m, s = divmod(duration, 60)
             embed = discord.Embed(
                 title=track['title'],
                 url=track['webpage_url'],
-                color=discord.Color.green(),
-                description=f"**Uploader:** {track['uploader']}\n**Duración:** {m}:{s:02d}"
+                color=discord.Color.blurple(),
+                timestamp=discord.utils.utcnow()
             )
-            thumb = track.get('thumbnail')
-            if thumb:
+            embed.set_author(name=track['uploader'], icon_url=self.ctx.author.avatar.url if self.ctx.author.avatar else None)
+            embed.add_field(name="Duración", value=f"{m}:{s:02d}", inline=True)
+            embed.add_field(name="Encolada por", value=self.ctx.author.mention, inline=True)
+            if thumb := track.get('thumbnail'):
                 embed.set_thumbnail(url=thumb)
+            embed.set_footer(text=f"Reproduciendo en {self.ctx.guild.name}")
 
-            # Play and send embed with controls
             vc.play(source)
-            view = MusicControls(self.guild_id)
+            view = MusicControls(self.guild_id, self)
             await self.ctx.send(embed=embed, view=view)
 
-            # Wait until done
+            # Wait
             while vc.is_playing() or vc.is_paused():
                 await asyncio.sleep(1)
 
-            # If queue is empty, disconnect and stop
             if self.queue.empty():
                 await vc.disconnect()
                 break
 
 @bot.command()
 async def play(ctx: commands.Context, *, query: str):
-    """Encola y reproduce URL o búsqueda de YouTube."""
     if not ctx.author.voice:
-        return await ctx.send("❌ Debes unirte a un canal de voz primero.")
+        return await ctx.send("❌ Únete a un canal de voz primero.")
     player = players.get(ctx.guild.id)
     if not player:
         player = MusicPlayer(ctx)
         players[ctx.guild.id] = player
 
-    # Loading message
     loading = await ctx.send("⏳ Cargando pistas...")
     data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     tracks = []
-    def build(entry):
+    def build(e):
         return {
-            'webpage_url': entry.get('webpage_url'),
-            'title': entry.get('title'),
-            'uploader': entry.get('uploader'),
-            'duration': entry.get('duration'),
-            'thumbnail': entry.get('thumbnail')
+            'webpage_url': e.get('webpage_url'),
+            'title': e.get('title'),
+            'uploader': e.get('uploader'),
+            'duration': e.get('duration'),
+            'thumbnail': e.get('thumbnail')
         }
 
     if data and 'entries' in data:
@@ -166,7 +179,7 @@ async def play(ctx: commands.Context, *, query: str):
     for t in tracks:
         await player.enqueue(t)
 
-    await loading.edit(content=f"✅ Encoladas {len(tracks)} pista(s).")
+    await loading.edit(content=f"✅ Encoladas {len(tracks)} pista(s). Usa !help para comandos.")
 
 @bot.command()
 async def skip(ctx: commands.Context):
@@ -190,12 +203,12 @@ async def stop(ctx: commands.Context):
 
 @bot.command()
 async def queue(ctx: commands.Context):
-    q = players.get(ctx.guild.id)
-    if not q or q.queue.empty():
+    player = players.get(ctx.guild.id)
+    if not player or player.queue.empty():
         return await ctx.send("❌ La cola está vacía.")
-    items = list(q.queue._queue)
-    msg = "\n".join(f"{i+1}. {t['title']}" for i, t in enumerate(items))
-    await ctx.send(f"📃 Cola:\n{msg}")
+    items = list(player.queue._queue)
+    text = "\n".join(f"{i+1}. {t['title']}" for i,t in enumerate(items))
+    await ctx.send(f"📜 Próximas canciones:\n{text}")
 
 @bot.command()
 async def join(ctx: commands.Context):
@@ -214,6 +227,18 @@ async def leave(ctx: commands.Context):
         await ctx.send("👋 Desconectado y cola limpia.")
     else:
         await ctx.send("❌ No estoy en un canal.")
+
+@bot.command(name='help')
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(title="Comandos del Music Bot", color=discord.Color.blue())
+    embed.add_field(name="!join", value="Une al bot a tu canal de voz.", inline=False)
+    embed.add_field(name="!leave", value="Desconecta al bot y limpia cola.", inline=False)
+    embed.add_field(name="!play <url/búsqueda>", value="Encola y reproduce de YouTube.", inline=False)
+    embed.add_field(name="!skip", value="Salta la canción actual.", inline=False)
+    embed.add_field(name="!stop", value="Detiene y desconecta al bot.", inline=False)
+    embed.add_field(name="!queue", value="Muestra las próximas canciones.", inline=False)
+    embed.add_field(name="Botones", value="Usa los botones debajo del embed de ahora reproduciendo para controlar.", inline=False)
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
