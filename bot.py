@@ -5,20 +5,19 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
 
-# Carga de configuración
+# Carga de variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Opciones de yt-dlp para manejar playlists y errores
+# Opciones de yt-dlp
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'skip_download': True,
-    'ignoreerrors': True,       # Ignorar videos no disponibles
-    'cookies': 'cookies.txt',    # Coloca tu cookies.txt en el repo
+    'ignoreerrors': True,
+    'cookies': 'cookies.txt',
     'default_search': 'ytsearch',
 }
-# Opciones de FFmpeg: reconexión y sin video
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
@@ -34,30 +33,28 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 queues: dict[int, asyncio.Queue[dict]] = {}
 
 async def enqueue_tracks(ctx: commands.Context, query: str) -> list[dict]:
-    """Extrae info de URL o búsqueda, maneja playlists y omite entradas erróneas."""
+    """Extrae pistas de URL o búsqueda, maneja playlists, omite las no disponibles."""
     data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     tracks = []
-    def make_track(entry):
+    if not data:
+        return tracks
+
+    def build(entry):
         return {
-            'url': entry.get('webpage_url'),
+            'webpage_url': entry.get('webpage_url'),
             'title': entry.get('title'),
             'uploader': entry.get('uploader'),
             'duration': entry.get('duration'),
             'thumbnail': entry.get('thumbnail')
         }
 
-    if not data:
-        return tracks
-
     if 'entries' in data:
-        for entry in data['entries']:
-            if not entry:
+        for entry in data['entries'] or []:
+            if not entry or not entry.get('webpage_url'):
                 continue
-            track = make_track(entry)
-            if track['url']:
-                tracks.append(track)
+            tracks.append(build(entry))
     else:
-        tracks.append(make_track(data))
+        tracks.append(build(data))
 
     q = queues.setdefault(ctx.guild.id, asyncio.Queue())
     for t in tracks:
@@ -75,8 +72,16 @@ async def play_next(ctx: commands.Context):
         return
 
     track = await q.get()
-    # Crea la fuente con reconexión
-    source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS)
+
+    # Extraer info de streaming real
+    info = await bot.loop.run_in_executor(None,
+        lambda: ytdl.extract_info(track['webpage_url'], download=False)
+    )
+    if not info or not info.get('url'):
+        # Si falla, continuar con siguiente
+        return await play_next(ctx)
+
+    source = discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTS)
     vc.play(source, after=lambda e: bot.loop.create_task(play_next(ctx)))
 
     # Formatear duración
@@ -86,14 +91,14 @@ async def play_next(ctx: commands.Context):
 
     embed = discord.Embed(
         title=track['title'],
-        url=track['url'],
+        url=track['webpage_url'],
         color=discord.Color.green(),
         description=f"**Uploader:** {track['uploader']}\n**Duración:** {duration_str}"
     )
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
 
-    # Botones de control
+    # Botones
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="⏯️ Pause/Resume", style=discord.ButtonStyle.primary, custom_id="pause"))
     view.add_item(discord.ui.Button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, custom_id="skip"))
@@ -101,7 +106,6 @@ async def play_next(ctx: commands.Context):
 
     msg = await ctx.send(embed=embed, view=view)
 
-    # Manejar interacciones
     async def on_interaction(interaction: discord.Interaction):
         if interaction.message.id != msg.id:
             return
@@ -110,10 +114,9 @@ async def play_next(ctx: commands.Context):
         if cid == "pause":
             if vc.is_paused():
                 vc.resume()
-                await interaction.response.edit_message(content=None, embed=embed, view=view)
             else:
                 vc.pause()
-                await interaction.response.edit_message(content=None, embed=embed, view=view)
+            await interaction.response.edit_message(embed=embed, view=view)
         elif cid == "skip":
             if vc.is_playing():
                 vc.stop()
