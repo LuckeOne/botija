@@ -30,10 +30,8 @@ FFMPEG_OPTS = {
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-# Remove default help command to allow custom help
 bot.remove_command('help')
 
-# One MusicPlayer per guild
 players: dict[int, "MusicPlayer"] = {}
 
 class MusicControls(discord.ui.View):
@@ -99,7 +97,6 @@ class MusicPlayer:
         await self.queue.put(track)
 
     async def player_loop(self):
-        # Connect if not already
         if not self.ctx.guild.voice_client:
             await self.ctx.author.voice.channel.connect()
         vc = self.ctx.guild.voice_client
@@ -113,16 +110,14 @@ class MusicPlayer:
             if not info or 'formats' not in info:
                 continue
 
-            # Pick best
             formats = [f for f in info['formats'] if f.get('url')]
             fmt = max(formats, key=lambda f: f.get('abr') or 0)
             url = fmt['url']
             headers = fmt.get('http_headers', {})
-            hdr_str = "".join(f"{k}: {v}\r\n" for k,v in headers.items())
+            hdr_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             before = f"{FFMPEG_BEFORE} -headers \"{hdr_str}\""
             source = discord.FFmpegPCMAudio(url, before_options=before, options='-vn')
 
-            # Enhanced embed
             duration = track.get('duration') or 0
             m, s = divmod(duration, 60)
             embed = discord.Embed(
@@ -142,7 +137,6 @@ class MusicPlayer:
             view = MusicControls(self.guild_id, self)
             await self.ctx.send(embed=embed, view=view)
 
-            # Wait
             while vc.is_playing() or vc.is_paused():
                 await asyncio.sleep(1)
 
@@ -160,10 +154,8 @@ async def play(ctx: commands.Context, *, query: str):
         players[ctx.guild.id] = player
 
     loading = await ctx.send("⏳ Cargando pistas...")
-    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
-    tracks = []
-        def build(e):
-        # Asegúrate de usar la URL de página o la URL/id proporcionada
+
+    def build(e):
         page = e.get('webpage_url') or e.get('url') or f"https://www.youtube.com/watch?v={e.get('id')}"
         return {
             'webpage_url': page,
@@ -173,12 +165,18 @@ async def play(ctx: commands.Context, *, query: str):
             'thumbnail': e.get('thumbnail')
         }
 
+    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+    tracks = []
+
     if data and 'entries' in data:
         for e in data['entries'] or []:
-            if e and e.get('webpage_url'):
+            if e:
                 tracks.append(build(e))
     elif data:
         tracks.append(build(data))
+
+    if not tracks:
+        return await loading.edit(content="❌ No se encontraron pistas.")
 
     for t in tracks:
         await player.enqueue(t)
@@ -211,7 +209,7 @@ async def queue(ctx: commands.Context):
     if not player or player.queue.empty():
         return await ctx.send("❌ La cola está vacía.")
     items = list(player.queue._queue)
-    text = "\n".join(f"{i+1}. {t['title']}" for i,t in enumerate(items))
+    text = "\n".join(f"{i+1}. {t['title']}" for i, t in enumerate(items))
     await ctx.send(f"📜 Próximas canciones:\n{text}")
 
 @bot.command()
