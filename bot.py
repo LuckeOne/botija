@@ -9,113 +9,137 @@ import yt_dlp
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Opciones de yt-dlp con soporte de cookies
-ytdl_opts = {
+# yt-dlp + ffmpeg
+YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'skip_download': True,
-    'cookies': 'cookies.txt',  # 🟡 Asegúrate de que este archivo esté presente
+    'cookies': 'cookies.txt',
+    'default_search': 'ytsearch',
 }
-ffmpeg_opts = {
+FFMPEG_OPTS = {
     'options': '-vn'
 }
-ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
-# Intents y bot
+class MusicPlayer:
+    """Gestiona la cola y la reproducción en un guild."""
+    def __init__(self, bot: commands.Bot, ctx: commands.Context):
+        self.bot = bot
+        self.ctx = ctx
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.play_next_song = asyncio.Event()
+        self.current = None
+        self.audio_task = bot.loop.create_task(self.audio_loop())
+
+    async def audio_loop(self):
+        await self.bot.wait_until_ready()
+        while True:
+            self.play_next_song.clear()
+            url = await self.queue.get()
+            # extraer info
+            data = await self.bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+            if 'entries' in data:
+                # playlist: encolar todas las entradas
+                for entry in data['entries']:
+                    self.queue.put_nowait(entry['url'])
+                continue
+            source = discord.FFmpegPCMAudio(data['url'], **FFMPEG_OPTS)
+            self.current = data.get('title', url)
+            vc: discord.VoiceClient = self.ctx.voice_client
+            if not vc or not vc.is_connected():
+                vc = await self.ctx.author.voice.channel.connect()
+            vc.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next_song.set))
+            await self.ctx.send(f"▶️ Reproduciendo: **{self.current}**")
+            await self.play_next_song.wait()
+
+    def add_to_queue(self, url: str):
+        self.queue.put_nowait(url)
+
+    def skip(self):
+        vc = self.ctx.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
+
+    async def stop(self):
+        vc = self.ctx.voice_client
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+        self.audio_task.cancel()
+
+class Music(commands.Cog):
+    """Cog de música con comandos !join, !play, !skip, !stop, !queue."""
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.players: dict[int, MusicPlayer] = {}
+
+    def get_player(self, ctx: commands.Context) -> MusicPlayer:
+        guild_id = ctx.guild.id
+        if guild_id not in self.players:
+            self.players[guild_id] = MusicPlayer(self.bot, ctx)
+        return self.players[guild_id]
+
+    @commands.command(name="join")
+    async def join(self, ctx: commands.Context):
+        if not ctx.author.voice:
+            return await ctx.send("❌ Conéctate a un canal de voz primero.")
+        await ctx.author.voice.channel.connect()
+        await ctx.send("✅ Me he unido al canal de voz.")
+
+    @commands.command(name="leave")
+    async def leave(self, ctx: commands.Context):
+        player = self.players.pop(ctx.guild.id, None)
+        if player:
+            await player.stop()
+            await ctx.send("👋 Me he desconectado y limpié la cola.")
+        else:
+            await ctx.send("❌ No estoy en un canal de voz.")
+
+    @commands.command(name="play")
+    async def play(self, ctx: commands.Context, *, query: str):
+        """Encola una URL o busca en YouTube."""
+        if not ctx.author.voice:
+            return await ctx.send("❌ Debes estar en un canal de voz.")
+        player = self.get_player(ctx)
+        player.add_to_queue(query)
+        await ctx.send(f"▶️ Encolado: **{query}**")
+
+    @commands.command(name="skip")
+    async def skip(self, ctx: commands.Context):
+        player = self.players.get(ctx.guild.id)
+        if not player:
+            return await ctx.send("❌ No hay nada reproduciéndose.")
+        player.skip()
+        await ctx.send("⏭️ Saltando canción.")
+
+    @commands.command(name="stop")
+    async def stop(self, ctx: commands.Context):
+        player = self.players.pop(ctx.guild.id, None)
+        if not player:
+            return await ctx.send("❌ No estoy en un canal de voz.")
+        await player.stop()
+        await ctx.send("🛑 Detenido y desconectado.")
+
+    @commands.command(name="queue")
+    async def queue_(self, ctx: commands.Context):
+        player = self.players.get(ctx.guild.id)
+        if not player or player.queue.empty():
+            return await ctx.send("❌ La cola está vacía.")
+        upcoming = list(player.queue._queue)
+        msg = "\n".join(f"{i+1}. {item}" for i, item in enumerate(upcoming))
+        await ctx.send(f"📃 Próximas canciones:\n{msg}")
+
+# Configuración del bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Cola de URLs por guild
-queues: dict[int, asyncio.Queue] = {}
+bot.add_cog(Music(bot))
 
-def is_url(string: str) -> bool:
-    return string.startswith("http://") or string.startswith("https://")
-
-async def get_audio_source(url: str):
-    """Extrae la URL de audio con yt-dlp y la envuelve en FFmpegPCMAudio."""
-    info = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-    # Si es playlist, devolvemos lista de URLs
-    if 'entries' in info:
-        return [entry['url'] for entry in info['entries'] if 'url' in entry]
-    return discord.FFmpegPCMAudio(info['url'], **ffmpeg_opts)
-
-async def play_next(ctx: commands.Context, vc: discord.VoiceClient):
-    guild_id = ctx.guild.id
-    queue = queues.get(guild_id)
-    if not queue or queue.empty():
-        return await vc.disconnect()
-
-    url = await queue.get()
-    extract_url = url if is_url(url) else f"ytsearch1:{url}"
-
-    try:
-        result = await get_audio_source(extract_url)
-    except Exception as e:
-        await ctx.send(f"❌ Error al reproducir: {e}")
-        return await play_next(ctx, vc)
-
-    if isinstance(result, list):
-        for item in result:
-            queue.put_nowait(item)
-        return await play_next(ctx, vc)
-
-    vc.play(result, after=lambda e: bot.loop.create_task(play_next(ctx, vc)))
-
-@bot.command()
-async def join(ctx: commands.Context):
-    if not ctx.author.voice:
-        return await ctx.send("❌ Conéctate a un canal de voz primero.")
-    await ctx.author.voice.channel.connect()
-    await ctx.send("✅ Me he unido al canal.")
-
-@bot.command()
-async def leave(ctx: commands.Context):
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("👋 Adiós.")
-    else:
-        await ctx.send("❌ No estoy en ningún canal.")
-
-@bot.command()
-async def play(ctx: commands.Context, *, query: str):
-    """Reproduce una URL o búsqueda de YouTube."""
-    guild_id = ctx.guild.id
-    queues.setdefault(guild_id, asyncio.Queue())
-    queues[guild_id].put_nowait(query)
-    await ctx.send(f"▶️ Encolada: **{query}**")
-
-    vc = ctx.voice_client or await ctx.author.voice.channel.connect()
-    if not vc.is_playing():
-        await play_next(ctx, vc)
-
-@bot.command()
-async def skip(ctx: commands.Context):
-    vc = ctx.voice_client
-    if vc and vc.is_playing():
-        vc.stop()
-        await ctx.send("⏭️ Saltando canción.")
-    else:
-        await ctx.send("❌ No hay reproducción activa.")
-
-@bot.command(name="queue")
-async def queue_cmd(ctx: commands.Context):
-    queue = queues.get(ctx.guild.id)
-    if not queue or queue.empty():
-        return await ctx.send("❌ La cola está vacía.")
-    items = list(queue._queue)
-    msg = "\n".join(f"{i+1}. {item}" for i, item in enumerate(items))
-    await ctx.send(f"📃 Cola:\n{msg}")
-
-@bot.command(name="stop")
-async def stop_cmd(ctx: commands.Context):
-    vc = ctx.voice_client
-    if vc:
-        vc.stop()
-        await vc.disconnect()
-        await ctx.send("🛑 Detenido y desconectado.")
-    else:
-        await ctx.send("❌ No estoy en un canal de voz.")
+@bot.event
+async def on_ready():
+    print(f"✅ Bot conectado como {bot.user}")
 
 if __name__ == "__main__":
     if not TOKEN:
