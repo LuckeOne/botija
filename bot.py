@@ -162,9 +162,11 @@ async def play(ctx: commands.Context, *, query: str):
     loading = await ctx.send("⏳ Cargando pistas...")
     data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     tracks = []
-    def build(e):
+        def build(e):
+        # Asegúrate de usar la URL de página o la URL/id proporcionada
+        page = e.get('webpage_url') or e.get('url') or f"https://www.youtube.com/watch?v={e.get('id')}"
         return {
-            'webpage_url': e.get('webpage_url'),
+            'webpage_url': page,
             'title': e.get('title'),
             'uploader': e.get('uploader'),
             'duration': e.get('duration'),
